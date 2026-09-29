@@ -1,4 +1,4 @@
-import { Download, FileJson, FileText, ShieldCheck } from 'lucide-react';
+import { Archive, Download, FileJson, FileText, ShieldCheck } from 'lucide-react';
 import { useMemo } from 'react';
 import { Badge } from '../components/ui/badge';
 import { Button } from '../components/ui/button';
@@ -11,6 +11,7 @@ import {
   SelectValue,
 } from '../components/ui/select';
 import { formatDateTime } from '../lib/utils';
+import { getMergedChange } from '../models/contract';
 import { buildChangeReport } from '../services/contract-service';
 import { useContracts } from '../services/contract-queries';
 import { useReviewStore } from '../store/review-store';
@@ -24,7 +25,11 @@ export function ReportsPage() {
     contracts.data?.[0];
 
   const report = useMemo(() => (contract ? buildChangeReport(contract) : ''), [contract]);
-  const reviewed = contract?.changes.filter((change) => change.reviewState !== 'pending') ?? [];
+  const mergedChanges = useMemo(
+    () => (contract ? contract.changes.map((change) => getMergedChange(contract, change.id)) : []),
+    [contract],
+  );
+  const reviewed = mergedChanges.filter((change) => change.reviewState !== 'pending');
 
   return (
     <div>
@@ -90,9 +95,9 @@ export function ReportsPage() {
           {contract && (
             <div className="flex flex-wrap gap-2 sm:ml-auto">
               <Badge tone="blue">{contract.domain}</Badge>
-              <Badge tone="neutral">{contract.changes.length} 个变化</Badge>
-              <Badge tone={reviewed.length === contract.changes.length ? 'green' : 'amber'}>
-                {reviewed.length === contract.changes.length ? '评审完成' : '仍有待评审项'}
+              <Badge tone="neutral">{mergedChanges.length} 个变化</Badge>
+              <Badge tone={reviewed.length === mergedChanges.length ? 'green' : 'amber'}>
+                {reviewed.length === mergedChanges.length ? '评审完成' : '仍有待评审项'}
               </Badge>
             </div>
           )}
@@ -153,7 +158,7 @@ export function ReportsPage() {
                 <CardTitle>评审签名</CardTitle>
               </CardHeader>
               <CardContent className="space-y-3">
-                {contract.changes.map((change) => (
+                {mergedChanges.map((change) => (
                   <div
                     key={change.id}
                     className="flex items-start justify-between gap-3 border-b border-slate-100 pb-3 last:border-0 last:pb-0"
@@ -180,20 +185,55 @@ export function ReportsPage() {
                       >
                         {change.reviewState}
                       </Badge>
-                      {change.reviewedAt && (
-                        <div className="mt-1 text-[10px] text-slate-400">
-                          {formatDateTime(change.reviewedAt)}
-                        </div>
-                      )}
                     </div>
                   </div>
                 ))}
               </CardContent>
             </Card>
 
+            <Card>
+              <CardHeader>
+                <CardTitle>历史归档报告</CardTitle>
+                <p className="mt-1 text-xs text-slate-500">
+                  每次发布独立归档；即使该版回滚，报告仍保留可查
+                </p>
+              </CardHeader>
+              <CardContent className="space-y-2">
+                {contract.snapshots.map((snapshot) => (
+                  <div
+                    key={snapshot.id}
+                    className="flex items-center justify-between gap-2 rounded-md border border-slate-200 p-2"
+                  >
+                    <div className="flex items-center gap-2 text-xs text-slate-600">
+                      <Archive className="h-3.5 w-3.5 text-sky-800" />
+                      v{snapshot.version}
+                      <span className="text-slate-400">{formatDateTime(snapshot.releasedAt)}</span>
+                      {snapshot.rollbackState && <Badge tone="red">已回滚</Badge>}
+                    </div>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() =>
+                        downloadText(
+                          `${contract.id}-v${snapshot.version}-archived-report.md`,
+                          snapshot.report,
+                          'text/markdown;charset=utf-8',
+                        )
+                      }
+                    >
+                      <Download className="h-3.5 w-3.5" />
+                    </Button>
+                  </div>
+                ))}
+                {!contract.snapshots.length && (
+                  <p className="text-xs text-slate-400">发布后每份快照都会附带归档报告。</p>
+                )}
+              </CardContent>
+            </Card>
+
             <div className="flex items-start gap-3 rounded-md border border-slate-200 bg-white p-4 text-xs leading-5 text-slate-600">
               <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" />
-              报告在客户端生成，不依赖后端。正式版本冻结后仍可在历史版本页比较工作副本与发布快照。
+              工作区报告合并了各窗口候选的最新取值；正式归档报告随发布快照固定，回滚或后续编辑都不会改写历史版本。
             </div>
           </div>
         </div>

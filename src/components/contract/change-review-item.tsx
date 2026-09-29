@@ -5,29 +5,83 @@ import { Button } from '../ui/button';
 import { Textarea } from '../ui/textarea';
 import {
   CHANGE_KIND_LABELS,
+  type ApiContract,
   type ContractChange,
+  type FieldConflict,
+  type MergeableField,
   type ReviewState,
 } from '../../models/contract';
 import { CompatibilityBadge, ReviewStateBadge } from './compatibility-badge';
+import { ConflictCard } from './conflict-card';
 
 interface ChangeReviewItemProps {
+  contract: ApiContract;
   change: ContractChange;
+  /** 当前激活窗口在该字段上的草稿初值（来自它自己已提交的候选）。 */
+  activeWindowId: string;
+  activeWindowLabel: string;
+  onSubmitField: (changeId: string, field: MergeableField, value: string) => void;
   onReview: (changeId: string, state: ReviewState, comment: string) => void;
-  onUpdate: (changeId: string, patch: Partial<ContractChange>) => void;
   onExemption: (changeId: string, reason: string) => void;
+  onResolveConflict: (
+    changeId: string,
+    field: MergeableField,
+    keepCandidateId: string,
+  ) => void;
+  resolving: boolean;
+  submitting: boolean;
+  /** 各字段合并结果（含来源/冲突），由页面统一计算。 */
+  fields: Record<
+    MergeableField,
+    {
+      value: string;
+      source: 'baseline' | 'candidate';
+      windowLabel?: string;
+      author?: string;
+      conflict: FieldConflict | null;
+    }
+  >;
 }
 
 export function ChangeReviewItem({
+  contract,
   change,
+  activeWindowId,
+  activeWindowLabel,
+  onSubmitField,
   onReview,
-  onUpdate,
   onExemption,
+  onResolveConflict,
+  resolving,
+  submitting,
+  fields,
 }: ChangeReviewItemProps) {
-  const [comment, setComment] = useState(change.reviewComment);
-  const [impact, setImpact] = useState(change.impactStatement);
-  const [migration, setMigration] = useState(change.migrationPlan);
+  const myCandidateValue = (field: MergeableField) =>
+    contract.candidates.find(
+      (candidate) =>
+        candidate.changeId === change.id &&
+        candidate.field === field &&
+        candidate.windowId === activeWindowId &&
+        candidate.resolution !== 'discarded',
+    )?.value;
+
+  const [impact, setImpact] = useState(myCandidateValue('impactStatement') ?? fields.impactStatement.value);
+  const [migration, setMigration] = useState(
+    myCandidateValue('migrationPlan') ?? fields.migrationPlan.value,
+  );
+  const [comment, setComment] = useState(fields.reviewComment.value);
   const [exemptionReason, setExemptionReason] = useState('');
   const [showExemption, setShowExemption] = useState(false);
+
+  const conflictFields: MergeableField[] = (
+    [
+      'impactStatement',
+      'migrationPlan',
+      'reviewState',
+      'reviewer',
+      'reviewComment',
+    ] as const
+  ).filter((field) => fields[field].conflict);
 
   return (
     <article className="border-b border-slate-200 px-4 py-4 last:border-0">
@@ -38,18 +92,16 @@ export function ChangeReviewItem({
               {change.method} {change.path}
             </span>
             <CompatibilityBadge value={change.compatibility} />
-            <ReviewStateBadge value={change.reviewState} />
+            <ReviewStateBadge value={fields.reviewState.value as ReviewState} />
           </div>
           <h3 className="mt-2 text-sm font-semibold text-slate-900">
             {CHANGE_KIND_LABELS[change.kind]}
           </h3>
-          <p className="mt-1 max-w-3xl text-sm leading-6 text-slate-600">
-            {change.rationale}
-          </p>
+          <p className="mt-1 max-w-3xl text-sm leading-6 text-slate-600">{change.rationale}</p>
         </div>
         <div className="text-left text-xs text-slate-500 lg:text-right">
-          <div>评审人：{change.reviewer || '未指定'}</div>
-          <div className="mt-1">结论：{change.reviewComment || '尚无意见'}</div>
+          <div>评审人：{fields.reviewer.value || '未指定'}</div>
+          <div className="mt-1">结论：{fields.reviewComment.value || '尚无意见'}</div>
         </div>
       </div>
 
@@ -72,32 +124,54 @@ export function ChangeReviewItem({
         </div>
       </div>
 
+      {conflictFields.length > 0 && (
+        <div className="mt-4 space-y-2">
+          {conflictFields.map((field) => (
+            <ConflictCard
+              key={field}
+              contract={contract}
+              conflict={fields[field].conflict!}
+              path={change.path}
+              method={change.method}
+              resolving={resolving}
+              onResolve={(keepCandidateId) =>
+                onResolveConflict(change.id, field, keepCandidateId)
+              }
+            />
+          ))}
+        </div>
+      )}
+
       {change.compatibility !== 'compatible' && (
         <div className="mt-4 grid gap-3 lg:grid-cols-2">
-          <div>
-            <label className="mb-1.5 block text-xs font-medium text-slate-700">
-              调用方影响说明
-            </label>
-            <Textarea
-              value={impact}
-              onChange={(event) => setImpact(event.target.value)}
-              placeholder="受影响调用方、版本、流量和业务影响"
-            />
-          </div>
-          <div>
-            <label className="mb-1.5 block text-xs font-medium text-slate-700">迁移方案</label>
-            <Textarea
-              value={migration}
-              onChange={(event) => setMigration(event.target.value)}
-              placeholder="升级顺序、兼容层范围、回滚和截止时间"
-            />
-          </div>
+          <FieldEditor
+            label="调用方影响说明"
+            placeholder="受影响调用方、版本、流量和业务影响"
+            value={impact}
+            merged={fields.impactStatement}
+            windowLabel={activeWindowLabel}
+            submitting={submitting}
+            onChange={setImpact}
+            onSubmit={() => onSubmitField(change.id, 'impactStatement', impact)}
+          />
+          <FieldEditor
+            label="迁移方案"
+            placeholder="升级顺序、兼容层范围、回滚和截止时间"
+            value={migration}
+            merged={fields.migrationPlan}
+            windowLabel={activeWindowLabel}
+            submitting={submitting}
+            onChange={setMigration}
+            onSubmit={() => onSubmitField(change.id, 'migrationPlan', migration)}
+          />
         </div>
       )}
 
       <div className="mt-4 flex flex-col gap-3 border-t border-slate-100 pt-4 xl:flex-row xl:items-end">
         <div className="min-w-0 flex-1">
-          <label className="mb-1.5 block text-xs font-medium text-slate-700">评审意见</label>
+          <label className="mb-1.5 block text-xs font-medium text-slate-700">
+            评审意见（{activeWindowLabel}）
+          </label>
           <Textarea
             className="min-h-16"
             value={comment}
@@ -107,19 +181,6 @@ export function ChangeReviewItem({
         </div>
         <div className="flex flex-wrap gap-2">
           <Button
-            variant="secondary"
-            size="sm"
-            onClick={() =>
-              onUpdate(change.id, {
-                impactStatement: impact,
-                migrationPlan: migration,
-              })
-            }
-          >
-            <Save className="h-3.5 w-3.5" />
-            保存说明
-          </Button>
-          <Button
             variant="outline"
             size="sm"
             onClick={() => onReview(change.id, 'returned', comment || '需要补充影响说明')}
@@ -127,11 +188,7 @@ export function ChangeReviewItem({
             <CornerUpLeft className="h-3.5 w-3.5" />
             退回
           </Button>
-          <Button
-            variant="secondary"
-            size="sm"
-            onClick={() => setShowExemption((value) => !value)}
-          >
+          <Button variant="secondary" size="sm" onClick={() => setShowExemption((value) => !value)}>
             <Layers3 className="h-3.5 w-3.5" />
             申请兼容层
           </Button>
@@ -173,5 +230,61 @@ export function ChangeReviewItem({
         </div>
       )}
     </article>
+  );
+}
+
+function FieldEditor({
+  label,
+  placeholder,
+  value,
+  merged,
+  windowLabel,
+  submitting,
+  onChange,
+  onSubmit,
+}: {
+  label: string;
+  placeholder: string;
+  value: string;
+  merged: {
+    value: string;
+    source: 'baseline' | 'candidate';
+    windowLabel?: string;
+    author?: string;
+    conflict: FieldConflict | null;
+  };
+  windowLabel: string;
+  submitting: boolean;
+  onChange: (value: string) => void;
+  onSubmit: () => void;
+}) {
+  return (
+    <div>
+      <div className="mb-1.5 flex items-center justify-between gap-2">
+        <label className="text-xs font-medium text-slate-700">{label}</label>
+        {merged.source === 'candidate' && !merged.conflict && (
+          <span className="flex items-center gap-1 text-[10px] text-emerald-700">
+            <Save className="h-3 w-3" />
+            已合并自 {merged.windowLabel}
+            {merged.author ? ` · ${merged.author}` : ''}
+          </span>
+        )}
+      </div>
+      <Textarea value={value} onChange={(event) => onChange(event.target.value)} placeholder={placeholder} />
+      <div className="mt-1.5 flex items-center justify-between">
+        <span className="text-[10px] text-slate-400">
+          以「{windowLabel}」身份提交候选，与其他窗口的补充自动合并
+        </span>
+        <Button
+          variant="secondary"
+          size="sm"
+          disabled={submitting || value === merged.value}
+          onClick={onSubmit}
+        >
+          <Save className="h-3.5 w-3.5" />
+          提交候选
+        </Button>
+      </div>
+    </div>
   );
 }

@@ -1,4 +1,10 @@
-import type { ApiContract, ChangeKind } from '../models/contract';
+import type {
+  ApiContract,
+  ChangeKind,
+  ContractChange,
+  ReleaseSnapshot,
+  SnapshotConsumerImpact,
+} from '../models/contract';
 import { classifyChange } from '../models/contract';
 
 function openApi(
@@ -52,8 +58,13 @@ function change(
   kind: ChangeKind,
   before: string,
   after: string,
-  overrides: Partial<Omit<ApiContract['changes'][number], 'id' | 'path' | 'method' | 'kind' | 'before' | 'after' | 'compatibility' | 'rationale'>> = {},
-): ApiContract['changes'][number] {
+  overrides: Partial<
+    Omit<
+      ContractChange,
+      'id' | 'path' | 'method' | 'kind' | 'before' | 'after' | 'compatibility' | 'rationale'
+    >
+  > = {},
+): ContractChange {
   const classified = classifyChange({ kind, before, after });
   return {
     id,
@@ -71,6 +82,31 @@ function change(
     reviewComment: '',
     ...overrides,
   };
+}
+
+function archivedReport(
+  contract: Pick<ApiContract, 'name' | 'domain' | 'owner' | 'exemptions'>,
+  snapshot: Pick<ReleaseSnapshot, 'version' | 'releasedAt' | 'notes' | 'changes' | 'consumerImpacts'>,
+): string {
+  return [
+    `# ${contract.name} v${snapshot.version} 发布变更报告（归档）`,
+    '',
+    `- 领域：${contract.domain}`,
+    `- 负责人：${contract.owner}`,
+    `- 发布时间：${snapshot.releasedAt}`,
+    `- 发布说明：${snapshot.notes}`,
+    '',
+    '## 本次发布变化',
+    ...snapshot.changes.flatMap((item) => [
+      `### ${item.method} ${item.path} - ${item.kind}`,
+      `- 兼容性：${item.compatibility}`,
+      `- 调用方影响：${item.impactStatement || '未填写'}`,
+      `- 迁移方案：${item.migrationPlan || '未填写'}`,
+      '',
+    ]),
+    '## 调用方影响',
+    ...snapshot.consumerImpacts.map((impact) => `- ${impact.summary}`),
+  ].join('\n');
 }
 
 const orderOpenApi = openApi('订单履约 API', '2.8.0', [
@@ -112,6 +148,39 @@ const userOpenApi = openApi('用户权限 API', '1.14.0', [
   },
 ]);
 
+function makeSnapshot(
+  partial: Omit<
+    ReleaseSnapshot,
+    | 'baselineId'
+    | 'baselineLabel'
+    | 'changes'
+    | 'changesBeforeRelease'
+    | 'consumerImpacts'
+    | 'report'
+    | 'checksum'
+  > & {
+    changes: ContractChange[];
+    consumerImpacts: SnapshotConsumerImpact[];
+  },
+  contract: Pick<ApiContract, 'name' | 'domain' | 'owner' | 'exemptions'>,
+  checksumValue: string,
+): ReleaseSnapshot {
+  const snapshot: ReleaseSnapshot = {
+    ...partial,
+    baselineId: 'seed',
+    baselineLabel: '初始基线',
+    changesBeforeRelease: partial.changes,
+    checksum: checksumValue,
+    changes: partial.changes,
+    consumerImpacts: partial.consumerImpacts,
+    report: '',
+  };
+  return {
+    ...snapshot,
+    report: archivedReport(contract, snapshot),
+  };
+}
+
 export const seedContracts: ApiContract[] = [
   {
     id: 'contract-order',
@@ -123,6 +192,10 @@ export const seedContracts: ApiContract[] = [
     status: 'review',
     updatedAt: '2026-09-29T03:12:00.000Z',
     openapi: orderOpenApi,
+    baselineId: 'ver-order-270',
+    baselineLabel: 'v2.7.0',
+    baselineUpdatedAt: '2026-08-18T09:30:00.000Z',
+    candidates: [],
     changes: [
       change(
         'chg-order-1',
@@ -207,18 +280,7 @@ export const seedContracts: ApiContract[] = [
         expiresAt: '2026-10-31',
       },
     ],
-    versions: [
-      {
-        id: 'ver-order-270',
-        contractId: 'contract-order',
-        version: '2.7.0',
-        releasedAt: '2026-08-18T09:30:00.000Z',
-        checksum: 'a18d73f2',
-        notes: '新增批量查询能力。',
-        changeIds: [],
-        openapi: orderOpenApi.replaceAll('2.8.0', '2.7.0'),
-      },
-    ],
+    snapshots: [],
   },
   {
     id: 'contract-payment',
@@ -230,6 +292,10 @@ export const seedContracts: ApiContract[] = [
     status: 'ready',
     updatedAt: '2026-09-28T10:40:00.000Z',
     openapi: paymentOpenApi,
+    baselineId: 'ver-pay-410',
+    baselineLabel: 'v4.1.0',
+    baselineUpdatedAt: '2026-07-30T04:00:00.000Z',
+    candidates: [],
     changes: [
       change(
         'chg-pay-1',
@@ -285,18 +351,7 @@ export const seedContracts: ApiContract[] = [
       },
     ],
     exemptions: [],
-    versions: [
-      {
-        id: 'ver-pay-410',
-        contractId: 'contract-payment',
-        version: '4.1.0',
-        releasedAt: '2026-07-30T04:00:00.000Z',
-        checksum: 'f9ac1220',
-        notes: '统一退款错误码。',
-        changeIds: [],
-        openapi: paymentOpenApi.replaceAll('4.2.0', '4.1.0'),
-      },
-    ],
+    snapshots: [],
   },
   {
     id: 'contract-user',
@@ -308,6 +363,10 @@ export const seedContracts: ApiContract[] = [
     status: 'review',
     updatedAt: '2026-09-27T06:15:00.000Z',
     openapi: userOpenApi,
+    baselineId: 'seed-contract-user',
+    baselineLabel: '初始基线',
+    baselineUpdatedAt: '2026-09-27T06:15:00.000Z',
+    candidates: [],
     changes: [
       change(
         'chg-user-1',
@@ -336,6 +395,44 @@ export const seedContracts: ApiContract[] = [
       },
     ],
     exemptions: [],
-    versions: [],
+    snapshots: [],
   },
+];
+
+// 为前两个契约补上历史发布快照（独立快照、归档报告，旧版本可查）
+const orderContract = seedContracts[0]!;
+const payContract = seedContracts[1]!;
+orderContract.snapshots = [
+  makeSnapshot(
+    {
+      id: 'ver-order-270',
+      contractId: 'contract-order',
+      version: '2.7.0',
+      releasedAt: '2026-08-18T09:30:00.000Z',
+      notes: '新增批量查询能力。',
+      changeIds: [],
+      openapi: orderOpenApi.replaceAll('2.8.0', '2.7.0'),
+      changes: [],
+      consumerImpacts: [],
+    },
+    orderContract,
+    'a18d73f2',
+  ),
+];
+payContract.snapshots = [
+  makeSnapshot(
+    {
+      id: 'ver-pay-410',
+      contractId: 'contract-payment',
+      version: '4.1.0',
+      releasedAt: '2026-07-30T04:00:00.000Z',
+      notes: '统一退款错误码。',
+      changeIds: [],
+      openapi: paymentOpenApi.replaceAll('4.2.0', '4.1.0'),
+      changes: [],
+      consumerImpacts: [],
+    },
+    payContract,
+    'f9ac1220',
+  ),
 ];

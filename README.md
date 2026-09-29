@@ -17,10 +17,13 @@
 - OpenAPI JSON 导入、契约列表搜索和领域/状态筛选
 - 字段新增、删除、可选性、枚举与错误码变化展示
 - 自动判定兼容、警告或不兼容，并要求调用方影响说明与迁移方案
-- Monaco Editor 编辑契约定义，Monaco Diff Editor 比较正式版本快照
+- Monaco Editor 编辑契约定义，Monaco Diff Editor 比较发布快照
 - 调用方列表、示例请求生成、逐条接受、退回和兼容层豁免
-- 跨契约批量评审、发布门禁、正式版本冻结与版本历史
-- Markdown 变更报告与 JSON 导出
+- 跨契约批量评审、发布门禁与版本历史
+- **候选式协作编辑**：每个窗口从同一基线开始并携带基线标识；不同字段的补充自动合并，同一字段冲突时保留双方取值与来源供人工选择
+- **候选式发布**：只收集已接受且说明齐全的变化；基线过期或仍有冲突时门禁阻断
+- **独立快照与按版回滚**：每次发布留存独立快照（变化、调用方影响、归档报告）；回滚一次只恢复该快照内容，旧版本与报告仍可查
+- Markdown 工作区/归档变更报告与 JSON 导出
 
 ## 运行
 
@@ -38,6 +41,13 @@ npm run build
 ```
 
 构建输出位于 `dist`。
+
+候选合并与发布/回滚的纯逻辑校验（无需浏览器）：
+
+```bash
+npx esbuild scripts/check-merge.ts  --bundle --platform=node --format=esm --outfile=node_modules/.tmp/check-merge.mjs   && node node_modules/.tmp/check-merge.mjs
+npx esbuild scripts/check-release.ts --bundle --platform=node --format=esm --outfile=node_modules/.tmp/check-release.mjs && node node_modules/.tmp/check-release.mjs
+```
 
 ## 目录
 

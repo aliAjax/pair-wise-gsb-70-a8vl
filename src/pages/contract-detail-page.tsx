@@ -7,18 +7,28 @@ import {
   Download,
   FileWarning,
   GitCompare,
+  History,
   Layers3,
   LockKeyhole,
+  RotateCcw,
   Users,
 } from 'lucide-react';
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { ChangeReviewItem } from '../components/contract/change-review-item';
-import { CompatibilityBadge } from '../components/contract/compatibility-badge';
 import { ConsumerTable } from '../components/contract/consumer-table';
 import { ContractEditor } from '../components/contract/contract-editor';
+import { WindowBar } from '../components/contract/window-bar';
 import { Badge } from '../components/ui/badge';
 import { Button } from '../components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '../components/ui/dialog';
 import { Input } from '../components/ui/input';
 import { Progress } from '../components/ui/progress';
 import {
@@ -34,59 +44,140 @@ import { formatDateTime } from '../lib/utils';
 import {
   REVIEW_STATE_LABELS,
   type ApiContract,
-  type ContractChange,
+  type MergeableField,
   type ReviewState,
+  collectConflicts,
+  getMergedChange,
+  isChangeReleaseReady,
+  mergeField,
   validateForRelease,
 } from '../models/contract';
-import {
-  buildChangeReport,
-  diffVersionSummary,
-  generateExampleRequest,
-} from '../services/contract-service';
+import { buildChangeReport, generateExampleRequest } from '../services/contract-service';
 import {
   useAddExemption,
   useContract,
   useFreezeVersion,
+  useResolveConflict,
   useReviewChange,
-  useSaveContract,
+  useRollbackSnapshot,
+  useSubmitCandidate,
+  useSyncWindowBaseline,
   useUpdateOpenApi,
 } from '../services/contract-queries';
 import { useReviewStore } from '../store/review-store';
+
+const MERGEABLE_FIELDS: MergeableField[] = [
+  'impactStatement',
+  'migrationPlan',
+  'reviewState',
+  'reviewer',
+  'reviewComment',
+];
 
 export function ContractDetailPage() {
   const { contractId } = useParams({ from: '/contracts/$contractId' });
   const contractQuery = useContract(contractId);
   const activeTab = useReviewStore((state) => state.activeTab);
   const setActiveTab = useReviewStore((state) => state.setActiveTab);
+
+  const windows = useReviewStore((state) =>
+    state.windows.filter((window) => window.contractId === contractId),
+  );
+  const activeWindowId = useReviewStore((state) => state.activeWindowByContract[contractId] ?? '');
+  const ensureWindow = useReviewStore((state) => state.ensureWindow);
+  const setActiveWindow = useReviewStore((state) => state.setActiveWindow);
+  const addWindow = useReviewStore((state) => state.addWindow);
+  const removeWindow = useReviewStore((state) => state.removeWindow);
+  const setWindowAuthor = useReviewStore((state) => state.setWindowAuthor);
+
   const reviewChange = useReviewChange();
   const addExemption = useAddExemption();
   const updateOpenApi = useUpdateOpenApi();
-  const saveContract = useSaveContract();
+  const submitCandidate = useSubmitCandidate();
+  const resolveConflict = useResolveConflict();
+  const syncBaseline = useSyncWindowBaseline();
   const freezeVersion = useFreezeVersion();
+  const rollbackSnapshot = useRollbackSnapshot();
+
   const [releaseVersion, setReleaseVersion] = useState('');
   const [releaseNotes, setReleaseNotes] = useState('');
   const [reviewFilter, setReviewFilter] = useState<ReviewState | 'all'>('all');
-  const [selectedVersionId, setSelectedVersionId] = useState('');
+  const [selectedSnapshotId, setSelectedSnapshotId] = useState('');
+  const [freezeError, setFreezeError] = useState('');
+  const [rollbackTarget, setRollbackTarget] = useState<{ id: string; version: string } | null>(
+    null,
+  );
+  const [rollbackReason, setRollbackReason] = useState('');
+  const [rollbackError, setRollbackError] = useState('');
 
   const contract = contractQuery.data;
-  const issues = useMemo(
-    () => (contract ? validateForRelease(contract) : []),
+
+  // 进入详情页时确保至少有一个编辑窗口（副作用放在 effect 中）
+  useEffect(() => {
+    if (!contract) return;
+    const contractWindows = windows.filter((window) => window.contractId === contractId);
+    if (!contractWindows.length) {
+      ensureWindow(contractId);
+      return;
+    }
+    if (!activeWindowId || !contractWindows.some((window) => window.id === activeWindowId)) {
+      setActiveWindow(contractId, contractWindows[0].id);
+    }
+  }, [contract, windows, activeWindowId, contractId, ensureWindow, setActiveWindow]);
+
+  const activeWindow = useMemo(
+    () =>
+      windows.find((window) => window.id === activeWindowId) ??
+      windows.find((window) => window.contractId === contractId),
+    [windows, activeWindowId, contractId],
+  );
+
+  const mergedChanges = useMemo(
+    () => (contract ? contract.changes.map((change) => getMergedChange(contract, change.id)) : []),
     [contract],
   );
+
+  const fieldMerges = useMemo(() => {
+    if (!contract) return {};
+    const map: Record<
+      string,
+      Record<
+        MergeableField,
+        ReturnType<typeof mergeField>
+      >
+    > = {};
+    for (const change of contract.changes) {
+      map[change.id] = MERGEABLE_FIELDS.reduce(
+        (acc, field) => {
+          acc[field] = mergeField(contract, change.id, field);
+          return acc;
+        },
+        {} as Record<MergeableField, ReturnType<typeof mergeField>>,
+      );
+    }
+    return map;
+  }, [contract]);
+
+  const issues = useMemo(() => (contract ? validateForRelease(contract) : []), [contract]);
+  const conflicts = useMemo(() => (contract ? collectConflicts(contract) : []), [contract]);
   const blockers = issues.filter((issue) => issue.severity === 'blocker').length;
   const warnings = issues.filter((issue) => issue.severity === 'warning').length;
-  const acceptedCount = contract?.changes.filter((change) => change.reviewState !== 'pending').length ?? 0;
-  const reviewProgress = contract?.changes.length
-    ? Math.round((acceptedCount / contract.changes.length) * 100)
+  const acceptedCount = mergedChanges.filter((change) => change.reviewState !== 'pending').length;
+  const reviewProgress = mergedChanges.length
+    ? Math.round((acceptedCount / mergedChanges.length) * 100)
     : 100;
-  const selectedVersion =
-    contract?.versions.find((version) => version.id === selectedVersionId) ??
-    contract?.versions[0];
+  const readyToRelease = mergedChanges.filter((change) =>
+    contract ? isChangeReleaseReady(contract, change).ready : false,
+  );
+
+  const selectedSnapshot =
+    contract?.snapshots.find((snapshot) => snapshot.id === selectedSnapshotId) ??
+    contract?.snapshots[0];
 
   if (contractQuery.isLoading) {
     return <PageState text="正在加载契约详情..." />;
   }
-  if (contractQuery.isError || !contract) {
+  if (contractQuery.isError || !contract || !activeWindow) {
     return (
       <div className="rounded-lg border border-red-200 bg-white p-10 text-center">
         <h1 className="text-xl font-semibold">契约不存在</h1>
@@ -97,15 +188,16 @@ export function ContractDetailPage() {
       </div>
     );
   }
-  const currentContract = contract;
 
-  async function updateChange(changeId: string, patch: Partial<ContractChange>) {
-    if (!contract) return;
-    await saveContract.mutateAsync({
-      ...contract,
-      changes: contract.changes.map((change) =>
-        change.id === changeId ? { ...change, ...patch } : change,
-      ),
+  async function handleSubmitField(changeId: string, field: MergeableField, value: string) {
+    await submitCandidate.mutateAsync({
+      contractId,
+      changeId,
+      field,
+      value,
+      windowId: activeWindow!.id,
+      windowLabel: activeWindow!.label,
+      author: activeWindow!.author,
     });
   }
 
@@ -114,7 +206,7 @@ export function ContractDetailPage() {
       contractId,
       changeId,
       state,
-      reviewer: '当前评审人',
+      reviewer: activeWindow!.author,
       comment,
     });
   }
@@ -123,38 +215,76 @@ export function ContractDetailPage() {
     await addExemption.mutateAsync({ contractId, changeId, reason });
   }
 
+  async function handleResolve(
+    changeId: string,
+    field: MergeableField,
+    keepCandidateId: string,
+  ) {
+    await resolveConflict.mutateAsync({
+      contractId,
+      changeId,
+      field,
+      keepCandidateId,
+      resolvedBy: activeWindow!.author,
+    });
+  }
+
   async function saveOpenApi(value: string) {
     await updateOpenApi.mutateAsync({ contractId, openapi: value });
   }
 
   async function freeze() {
     if (!releaseVersion.trim()) return;
-    await freezeVersion.mutateAsync({
-      contractId,
-      version: releaseVersion.trim(),
-      notes: releaseNotes.trim() || '本版契约变更评审完成。',
-    });
-    setReleaseVersion('');
-    setReleaseNotes('');
+    setFreezeError('');
+    try {
+      await freezeVersion.mutateAsync({
+        contractId,
+        version: releaseVersion.trim(),
+        notes: releaseNotes.trim() || '本版契约变更评审完成。',
+      });
+      setReleaseVersion('');
+      setReleaseNotes('');
+    } catch (error) {
+      setFreezeError(error instanceof Error ? error.message : '发布失败');
+    }
+  }
+
+  async function confirmRollback() {
+    if (!rollbackTarget || !rollbackReason.trim()) return;
+    setRollbackError('');
+    try {
+      await rollbackSnapshot.mutateAsync({
+        contractId,
+        snapshotId: rollbackTarget.id,
+        reason: rollbackReason.trim(),
+        operator: activeWindow!.author,
+      });
+      setRollbackTarget(null);
+      setRollbackReason('');
+    } catch (error) {
+      setRollbackError(error instanceof Error ? error.message : '回滚失败');
+    }
   }
 
   function exportReport() {
     downloadText(
-      `${currentContract.id}-${currentContract.version}-change-report.md`,
-      buildChangeReport(currentContract),
+      `${contract!.id}-${contract!.version}-change-report.md`,
+      buildChangeReport(contract!),
       'text/markdown;charset=utf-8',
     );
   }
 
-  function exportJson() {
+  function exportSnapshotReport(snapshotId: string) {
+    const snapshot = contract!.snapshots.find((item) => item.id === snapshotId);
+    if (!snapshot) return;
     downloadText(
-      `${currentContract.id}-${currentContract.version}.json`,
-      JSON.stringify(currentContract, null, 2),
-      'application/json;charset=utf-8',
+      `${contract!.id}-v${snapshot.version}-archived-report.md`,
+      snapshot.report,
+      'text/markdown;charset=utf-8',
     );
   }
 
-  const filteredChanges = contract.changes.filter(
+  const filteredChanges = mergedChanges.filter(
     (change) => reviewFilter === 'all' || change.reviewState === reviewFilter,
   );
 
@@ -175,6 +305,7 @@ export function ContractDetailPage() {
               <span className="font-mono text-xs text-sky-800">{contract.protocol}</span>
               <Badge tone="slate">v{contract.version}</Badge>
               <StatusPill status={contract.status} />
+              <Badge tone="blue">基线 {contract.baselineLabel}</Badge>
             </div>
             <h1 className="mt-2 text-2xl font-semibold text-slate-950 sm:text-3xl">
               {contract.name}
@@ -185,23 +316,37 @@ export function ContractDetailPage() {
           </div>
           <div className="grid grid-cols-3 gap-px overflow-hidden rounded-lg border border-slate-200 bg-slate-200">
             <HeaderMetric label="变更项" value={String(contract.changes.length)} />
-            <HeaderMetric label="调用方" value={String(contract.consumers.length)} />
-            <HeaderMetric label="发布门禁" value={blockers ? `${blockers} 阻断` : '通过'} danger={!!blockers} />
+            <HeaderMetric label="待发布" value={String(readyToRelease.length)} />
+            <HeaderMetric
+              label="发布门禁"
+              value={blockers ? `${blockers} 阻断` : '通过'}
+              danger={!!blockers}
+            />
           </div>
         </div>
       </section>
 
-      <Tabs
-        value={activeTab}
-        onValueChange={setActiveTab}
-        className="mt-4"
-      >
+      <div className="mt-4">
+        <WindowBar
+          contract={contract}
+          windows={windows}
+          activeWindow={activeWindow}
+          syncing={syncBaseline.isPending}
+          onSelectWindow={(windowId) => setActiveWindow(contractId, windowId)}
+          onAddWindow={(label, author) => addWindow(contractId, label, author)}
+          onRemoveWindow={(windowId) => removeWindow(contractId, windowId)}
+          onAuthorChange={(author) => setWindowAuthor(contractId, activeWindow.id, author)}
+          onSyncBaseline={() => syncBaseline.mutate({ contractId, windowId: activeWindow.id })}
+        />
+      </div>
+
+      <Tabs value={activeTab} onValueChange={setActiveTab} className="mt-4">
         <TabsList>
           <TabsTrigger value="overview">概览与契约</TabsTrigger>
           <TabsTrigger value="changes">差异评审</TabsTrigger>
           <TabsTrigger value="consumers">调用方</TabsTrigger>
           <TabsTrigger value="release">发布门禁</TabsTrigger>
-          <TabsTrigger value="history">版本历史</TabsTrigger>
+          <TabsTrigger value="history">版本快照</TabsTrigger>
           <TabsTrigger value="report">变更报告</TabsTrigger>
         </TabsList>
 
@@ -223,7 +368,7 @@ export function ContractDetailPage() {
                     <div>
                       <span className="text-3xl font-semibold">{reviewProgress}%</span>
                       <p className="mt-1 text-xs text-slate-500">
-                        {acceptedCount} / {contract.changes.length} 项已有结论
+                        {acceptedCount} / {mergedChanges.length} 项已有结论
                       </p>
                     </div>
                     {!blockers && <CheckCircle2 className="h-6 w-6 text-emerald-600" />}
@@ -234,20 +379,22 @@ export function ContractDetailPage() {
 
               <Card>
                 <CardHeader>
-                  <CardTitle>兼容性摘要</CardTitle>
+                  <CardTitle>候选与冲突</CardTitle>
                 </CardHeader>
-                <CardContent className="space-y-3">
-                  {(['compatible', 'warning', 'breaking'] as const).map((level) => {
-                    const count = contract.changes.filter(
-                      (change) => change.compatibility === level,
-                    ).length;
-                    return (
-                      <div key={level} className="flex items-center justify-between">
-                        <CompatibilityBadge value={level} />
-                        <strong className="text-sm">{count} 项</strong>
-                      </div>
-                    );
-                  })}
+                <CardContent className="space-y-3 text-sm">
+                  <div className="flex items-center justify-between">
+                    <span className="text-slate-600">待合并候选</span>
+                    <strong>{contract.candidates.length}</strong>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-slate-600">未解决冲突</span>
+                    <strong className={conflicts.length ? 'text-red-700' : 'text-emerald-700'}>
+                      {conflicts.length}
+                    </strong>
+                  </div>
+                  <p className="text-xs leading-5 text-slate-500">
+                    不同字段的补充已自动合并；同字段冲突需在「差异评审」中选择保留版本。
+                  </p>
                 </CardContent>
               </Card>
 
@@ -272,7 +419,7 @@ export function ContractDetailPage() {
               <div>
                 <CardTitle>字段与错误码差异</CardTitle>
                 <p className="mt-1 text-xs text-slate-500">
-                  每种变化必须逐条接受、退回或申请兼容层
+                  每个窗口从基线提交候选；同字段冲突保留双方，选择后才能发布
                 </p>
               </div>
               <Select
@@ -295,13 +442,24 @@ export function ContractDetailPage() {
             <CardContent className="p-0">
               {filteredChanges.map((change) => (
                 <ChangeReviewItem
-                  key={`${change.id}-${change.reviewState}-${change.impactStatement}-${change.migrationPlan}`}
+                  key={`${change.id}-${activeWindow.id}-${
+                    fieldMerges[change.id]?.impactStatement.value
+                  }-${fieldMerges[change.id]?.migrationPlan.value}-${contract.candidates.length}`}
+                  contract={contract}
                   change={change}
-                  onReview={(changeId, state, comment) =>
-                    void handleReview(changeId, state, comment)
+                  activeWindowId={activeWindow.id}
+                  activeWindowLabel={activeWindow.label}
+                  fields={fieldMerges[change.id]!}
+                  submitting={submitCandidate.isPending}
+                  resolving={resolveConflict.isPending}
+                  onSubmitField={(changeId, field, value) =>
+                    void handleSubmitField(changeId, field, value)
                   }
-                  onUpdate={(changeId, patch) => void updateChange(changeId, patch)}
+                  onReview={(changeId, state, comment) => void handleReview(changeId, state, comment)}
                   onExemption={(changeId, reason) => void handleExemption(changeId, reason)}
+                  onResolveConflict={(changeId, field, keepCandidateId) =>
+                    void handleResolve(changeId, field, keepCandidateId)
+                  }
                 />
               ))}
               {!filteredChanges.length && (
@@ -316,7 +474,7 @@ export function ContractDetailPage() {
             <CardHeader>
               <CardTitle>依赖调用方列表</CardTitle>
               <p className="mt-1 text-xs text-slate-500">
-                用于判断一次契约变化影响的客户端、环境与流量规模
+                发布快照会记录每个调用方在该版本受到的影响；回滚时随该版一并恢复
               </p>
             </CardHeader>
             <CardContent className="p-0">
@@ -331,7 +489,7 @@ export function ContractDetailPage() {
               <CardHeader>
                 <CardTitle>发布前门禁</CardTitle>
                 <p className="mt-1 text-xs text-slate-500">
-                  {blockers} 个阻断项，{warnings} 个警告
+                  {blockers} 个阻断项，{warnings} 个警告；本次将收集 {readyToRelease.length} 项已接受且说明齐全的变化
                 </p>
               </CardHeader>
               <CardContent>
@@ -357,7 +515,7 @@ export function ContractDetailPage() {
                 ))}
                 {!issues.length && (
                   <div className="rounded-md border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-900">
-                    所有变更评审和迁移约束均已满足，可以冻结正式版本。
+                    基线最新、无冲突且说明齐全，可以生成本次独立发布快照。
                   </div>
                 )}
               </CardContent>
@@ -365,9 +523,9 @@ export function ContractDetailPage() {
 
             <Card>
               <CardHeader>
-                <CardTitle>冻结正式版本</CardTitle>
+                <CardTitle>生成发布快照</CardTitle>
                 <p className="mt-1 text-xs text-slate-500">
-                  冻结后版本定义不可覆盖，并保留校验值
+                  只冻结本版收集的变化；每次发布独立存档，回滚不影响其他版本
                 </p>
               </CardHeader>
               <CardContent>
@@ -385,13 +543,14 @@ export function ContractDetailPage() {
                   onChange={(event) => setReleaseNotes(event.target.value)}
                   placeholder="说明本版接口变化、兼容层和调用方升级状态"
                 />
+                {freezeError && <p className="mt-2 text-xs text-red-700">{freezeError}</p>}
                 <Button
                   className="mt-4 w-full"
                   disabled={!!blockers || !releaseVersion.trim() || freezeVersion.isPending}
                   onClick={() => void freeze()}
                 >
                   <LockKeyhole className="h-4 w-4" />
-                  {freezeVersion.isPending ? '冻结中' : '确认发布并冻结'}
+                  {freezeVersion.isPending ? '发布中' : '确认发布（独立快照）'}
                 </Button>
               </CardContent>
             </Card>
@@ -399,68 +558,120 @@ export function ContractDetailPage() {
         </TabsContent>
 
         <TabsContent value="history">
-          {selectedVersion ? (
+          {selectedSnapshot ? (
             <div className="grid gap-4 xl:grid-cols-[320px_1fr]">
               <Card>
                 <CardHeader>
-                  <CardTitle>正式版本</CardTitle>
+                  <CardTitle>发布快照</CardTitle>
                 </CardHeader>
                 <CardContent className="space-y-2">
-                  {contract.versions.map((version) => (
+                  {contract.snapshots.map((snapshot) => (
                     <button
-                      key={version.id}
+                      key={snapshot.id}
                       type="button"
                       className={
-                        selectedVersion.id === version.id
+                        selectedSnapshot.id === snapshot.id
                           ? 'w-full rounded-md border border-sky-300 bg-sky-50 p-3 text-left'
                           : 'w-full rounded-md border border-slate-200 p-3 text-left hover:bg-slate-50'
                       }
-                      onClick={() => setSelectedVersionId(version.id)}
+                      onClick={() => setSelectedSnapshotId(snapshot.id)}
                     >
                       <div className="flex items-center justify-between">
-                        <strong className="text-sm">v{version.version}</strong>
+                        <strong className="text-sm">v{snapshot.version}</strong>
                         <span className="font-mono text-[10px] text-slate-500">
-                          {version.checksum}
+                          {snapshot.checksum}
                         </span>
                       </div>
-                      <p className="mt-2 text-xs leading-5 text-slate-600">{version.notes}</p>
+                      <p className="mt-2 text-xs leading-5 text-slate-600">{snapshot.notes}</p>
+                      {snapshot.rollbackState && <Badge tone="red">已回滚</Badge>}
                     </button>
                   ))}
-                  {!contract.versions.length && (
-                    <p className="py-8 text-center text-sm text-slate-500">尚无正式版本。</p>
+                  {!contract.snapshots.length && (
+                    <p className="py-8 text-center text-sm text-slate-500">尚无发布快照。</p>
                   )}
                 </CardContent>
               </Card>
-              <Card>
-                <CardHeader>
-                  <CardTitle>与当前工作副本比较</CardTitle>
-                  <p className="mt-1 whitespace-pre-line text-xs text-slate-500">
-                    {diffVersionSummary(contract)}
-                  </p>
-                </CardHeader>
-                <CardContent>
-                  <div className="overflow-hidden rounded-md border border-slate-200">
-                    <DiffEditor
-                      height="520px"
-                      language="plaintext"
-                      original={selectedVersion.openapi}
-                      modified={contract.openapi}
-                      options={{
-                        readOnly: true,
-                        minimap: { enabled: false },
-                        renderSideBySide: true,
-                        fontSize: 12,
-                        automaticLayout: true,
-                      }}
-                    />
-                  </div>
-                </CardContent>
-              </Card>
+              <div className="space-y-4">
+                <Card>
+                  <CardHeader className="flex flex-row items-center justify-between">
+                    <div>
+                      <CardTitle>快照 v{selectedSnapshot.version}</CardTitle>
+                      <p className="mt-1 whitespace-pre-line text-xs text-slate-500">
+                        发布于 {formatDateTime(selectedSnapshot.releasedAt)} · 纳入{' '}
+                        {selectedSnapshot.changes.length} 项变化
+                        {selectedSnapshot.rollbackState
+                          ? ` · 已于 ${formatDateTime(selectedSnapshot.rollbackState.rolledBackAt)} 回滚`
+                          : ''}
+                      </p>
+                    </div>
+                    <div className="flex gap-2">
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        onClick={() => exportSnapshotReport(selectedSnapshot.id)}
+                      >
+                        <Download className="h-3.5 w-3.5" />
+                        归档报告
+                      </Button>
+                      {!selectedSnapshot.rollbackState &&
+                        contract.snapshots[0]?.id === selectedSnapshot.id && (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => {
+                              setRollbackError('');
+                              setRollbackTarget({
+                                id: selectedSnapshot.id,
+                                version: selectedSnapshot.version,
+                              });
+                            }}
+                          >
+                            <RotateCcw className="h-3.5 w-3.5" />
+                            回滚此版
+                          </Button>
+                        )}
+                    </div>
+                  </CardHeader>
+                  <CardContent className="space-y-4">
+                    <div>
+                      <strong className="text-xs font-medium text-slate-700">本版调用方影响</strong>
+                      <div className="mt-2 space-y-2">
+                        {selectedSnapshot.consumerImpacts.map((impact) => (
+                          <div
+                            key={impact.consumerId}
+                            className="rounded-md border border-slate-200 p-2 text-xs leading-5 text-slate-600"
+                          >
+                            {impact.summary}
+                          </div>
+                        ))}
+                        {!selectedSnapshot.consumerImpacts.length && (
+                          <p className="text-xs text-slate-400">该版无警告/不兼容级调用方影响。</p>
+                        )}
+                      </div>
+                    </div>
+                    <div className="overflow-hidden rounded-md border border-slate-200">
+                      <DiffEditor
+                        height="420px"
+                        language="plaintext"
+                        original={selectedSnapshot.openapi}
+                        modified={contract.openapi}
+                        options={{
+                          readOnly: true,
+                          minimap: { enabled: false },
+                          renderSideBySide: true,
+                          fontSize: 12,
+                          automaticLayout: true,
+                        }}
+                      />
+                    </div>
+                  </CardContent>
+                </Card>
+              </div>
             </div>
           ) : (
             <Card>
               <CardContent className="py-14 text-center text-sm text-slate-500">
-                暂无版本可比较。
+                暂无快照可比较。
               </CardContent>
             </Card>
           )}
@@ -471,8 +682,10 @@ export function ContractDetailPage() {
             <Card>
               <CardHeader className="flex flex-row items-center justify-between">
                 <div>
-                  <CardTitle>变更报告预览</CardTitle>
-                  <p className="mt-1 text-xs text-slate-500">Markdown 格式，可直接进入评审材料</p>
+                  <CardTitle>变更报告预览（工作区合并视图）</CardTitle>
+                  <p className="mt-1 text-xs text-slate-500">
+                    Markdown 格式，已合并各窗口候选；归档版在「版本快照」内随版保留
+                  </p>
                 </div>
                 <Button variant="secondary" size="sm" onClick={exportReport}>
                   <Download className="h-3.5 w-3.5" />
@@ -507,20 +720,73 @@ export function ContractDetailPage() {
                     label="兼容层豁免"
                     value={`${contract.exemptions.length} 条`}
                   />
+                  <ReportFact
+                    icon={History}
+                    label="历史快照报告"
+                    value={`${contract.snapshots.length} 份可查`}
+                  />
                 </CardContent>
               </Card>
-              <div className="flex gap-2">
-                <Button variant="secondary" className="flex-1" onClick={exportJson}>
-                  导出 JSON
-                </Button>
-                <Button variant="outline" className="flex-1" onClick={exportReport}>
-                  导出 Markdown
-                </Button>
-              </div>
+              <Card>
+                <CardHeader>
+                  <CardTitle>归档报告入口</CardTitle>
+                </CardHeader>
+                <CardContent className="space-y-2">
+                  {contract.snapshots.map((snapshot) => (
+                    <button
+                      key={snapshot.id}
+                      type="button"
+                      onClick={() => {
+                        setActiveTab('history');
+                        setSelectedSnapshotId(snapshot.id);
+                      }}
+                      className="flex w-full items-center justify-between rounded-md border border-slate-200 px-3 py-2 text-left text-xs hover:bg-slate-50"
+                    >
+                      <span>v{snapshot.version} 归档报告</span>
+                      <span className="text-slate-400">{formatDateTime(snapshot.releasedAt)}</span>
+                    </button>
+                  ))}
+                  {!contract.snapshots.length && (
+                    <p className="text-xs text-slate-400">发布后每份快照都会附带归档报告。</p>
+                  )}
+                </CardContent>
+              </Card>
             </div>
           </div>
         </TabsContent>
       </Tabs>
+
+      <Dialog open={!!rollbackTarget} onOpenChange={(open) => !open && setRollbackTarget(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>回滚 v{rollbackTarget?.version} 这一版</DialogTitle>
+            <DialogDescription>
+              只会恢复该快照包含的变化与调用方影响，使其回到工作区继续评审；其他版本不受影响。
+              快照与归档报告仍保留可查，并标记为已回滚。
+            </DialogDescription>
+          </DialogHeader>
+          <label className="text-xs font-medium text-slate-700">回滚原因</label>
+          <Textarea
+            className="mt-1.5"
+            value={rollbackReason}
+            onChange={(event) => setRollbackReason(event.target.value)}
+            placeholder="说明哪一项变化发错、影响范围和后续处理"
+          />
+          {rollbackError && <p className="mt-2 text-xs text-red-700">{rollbackError}</p>}
+          <DialogFooter>
+            <Button variant="secondary" onClick={() => setRollbackTarget(null)}>
+              取消
+            </Button>
+            <Button
+              disabled={!rollbackReason.trim() || rollbackSnapshot.isPending}
+              onClick={() => void confirmRollback()}
+            >
+              <RotateCcw className="h-4 w-4" />
+              {rollbackSnapshot.isPending ? '回滚中' : '确认只回滚此版'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

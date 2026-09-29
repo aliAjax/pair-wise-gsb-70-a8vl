@@ -21,6 +21,7 @@ import {
   REVIEW_STATE_LABELS,
   type ContractChange,
   type ReviewState,
+  getMergedChange,
 } from '../models/contract';
 import { useBulkReview, useContracts } from '../services/contract-queries';
 import { useReviewStore } from '../store/review-store';
@@ -50,13 +51,16 @@ export function ReviewQueuePage() {
     () =>
       (contracts.data ?? [])
         .flatMap((contract) =>
-          contract.changes.map((change) => ({
-            contractId: contract.id,
-            contractName: contract.name,
-            version: contract.version,
-            updatedAt: contract.updatedAt,
-            change,
-          })),
+          contract.changes.map((baseChange) => {
+            const change: ContractChange = getMergedChange(contract, baseChange.id);
+            return {
+              contractId: contract.id,
+              contractName: contract.name,
+              version: contract.version,
+              updatedAt: contract.updatedAt,
+              change,
+            };
+          }),
         )
         .filter((item) => {
           const keyword = query.trim().toLowerCase();

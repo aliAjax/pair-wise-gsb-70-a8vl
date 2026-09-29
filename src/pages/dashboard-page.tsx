@@ -97,8 +97,9 @@ export function DashboardPage() {
         throw new Error('OpenAPI 文档缺少 info.title');
       }
       const now = new Date().toISOString();
+      const contractId = `contract-${Date.now()}`;
       const contract: ApiContract = {
-        id: `contract-${Date.now()}`,
+        id: contractId,
         name: parsed.info.title,
         version: parsed.info.version ?? '0.1.0',
         domain: '待分类',
@@ -110,7 +111,11 @@ export function DashboardPage() {
         changes: [],
         consumers: [],
         exemptions: [],
-        versions: [],
+        candidates: [],
+        baselineId: `seed-${contractId}`,
+        baselineLabel: '初始基线',
+        baselineUpdatedAt: now,
+        snapshots: [],
       };
       await saveContract.mutateAsync(contract);
       setImportText('');
@@ -322,7 +327,7 @@ export function DashboardPage() {
           <CardContent className="space-y-3">
             {(contracts.data ?? [])
               .flatMap((contract) =>
-                contract.versions.map((version) => ({ contract, version })),
+                contract.snapshots.map((snapshot) => ({ contract, version: snapshot })),
               )
               .sort(
                 (left, right) =>
@@ -341,7 +346,11 @@ export function DashboardPage() {
                       v{version.version} · {formatDateTime(version.releasedAt)} · {version.checksum}
                     </div>
                   </div>
-                  <Badge tone="slate">已冻结</Badge>
+                  {version.rollbackState ? (
+                    <Badge tone="red">已回滚</Badge>
+                  ) : (
+                    <Badge tone="slate">生效中</Badge>
+                  )}
                 </div>
               ))}
           </CardContent>
@@ -355,10 +364,10 @@ export function DashboardPage() {
           <CardContent>
             <ol className="space-y-4 text-sm text-slate-700">
               {[
-                '逐条确认兼容、警告或不兼容结论',
-                '为警告和不兼容变化补充调用方影响',
-                '完成迁移方案或登记兼容层豁免',
-                '冻结版本并生成变更报告',
+                '各窗口基于同一基线提交字段候选并逐条评审',
+                '不同字段自动合并，同字段冲突人工选择保留版本',
+                '基线过期先同步，已接受变化补齐调用方影响与迁移方案',
+                '发布独立快照并归档报告，需要时按版回滚',
               ].map((item, index) => (
                 <li key={item} className="flex gap-3">
                   <span className="grid h-6 w-6 shrink-0 place-items-center rounded-sm bg-slate-100 text-xs font-semibold text-sky-900">

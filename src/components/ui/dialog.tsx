@@ -35,6 +35,12 @@ export function DialogHeader({ className, ...props }: React.HTMLAttributes<HTMLD
   return <div className={cn('mb-4 pr-8', className)} {...props} />;
 }
 
+export function DialogFooter({ className, ...props }: React.HTMLAttributes<HTMLDivElement>) {
+  return (
+    <div className={cn('mt-4 flex justify-end gap-2', className)} {...props} />
+  );
+}
+
 export function DialogTitle({
   className,
   ...props
