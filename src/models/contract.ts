@@ -9,6 +9,12 @@ export type ChangeKind =
 export type Compatibility = 'compatible' | 'warning' | 'breaking';
 export type ReviewState = 'pending' | 'accepted' | 'returned' | 'exemption';
 
+export interface FieldProvenance {
+  source: string;
+  candidateId: string;
+  at: string;
+}
+
 export interface ContractChange {
   id: string;
   path: string;
@@ -20,10 +26,15 @@ export interface ContractChange {
   rationale: string;
   impactStatement: string;
   migrationPlan: string;
+  impactProvenance?: FieldProvenance;
+  migrationProvenance?: FieldProvenance;
   reviewState: ReviewState;
   reviewer: string;
   reviewComment: string;
   reviewedAt?: string;
+  /** 已随哪个发布快照冻结；非空时不再进入后续发布，回滚该快照会清空 */
+  releasedInVersionId?: string;
+  releasedInVersion?: string;
 }
 
 export interface ApiConsumer {
@@ -45,6 +56,17 @@ export interface Exemption {
   expiresAt: string;
 }
 
+export type ReleaseStatus = 'active' | 'rolled_back';
+
+export interface ReleaseConsumerImpact {
+  consumerId: string;
+  name: string;
+  environment: ApiConsumer['environment'];
+  clientVersion: string;
+  requestsPerDay: number;
+  impactSummary: string;
+}
+
 export interface ContractVersion {
   id: string;
   contractId: string;
@@ -54,6 +76,17 @@ export interface ContractVersion {
   notes: string;
   changeIds: string[];
   openapi: string;
+  /** 发布时所基于的基线标识，过期基线不允许冻结 */
+  baselineId: string;
+  /** 发布后该快照内变化的调用方影响摘要，回滚时仅恢复本快照范围 */
+  consumerImpacts: ReleaseConsumerImpact[];
+  /** 发布时已接受变化的完整副本，旧版本回滚不影响其他已发布快照 */
+  changes: ContractChange[];
+  status: ReleaseStatus;
+  rolledBackAt?: string;
+  rollbackReason?: string;
+  /** 每次发布独立生成的 Markdown 报告，快照回滚后仍可查阅 */
+  report: string;
 }
 
 export interface ApiContract {
@@ -70,15 +103,44 @@ export interface ApiContract {
   consumers: ApiConsumer[];
   exemptions: Exemption[];
   versions: ContractVersion[];
+  /** 已提交工作副本的乐观锁基线标识，任何合并/发布/评审都会推进 */
+  baselineId: string;
 }
+
+export type ReleaseIssueKind =
+  | 'stale_baseline'
+  | 'conflict'
+  | 'open_candidate'
+  | 'missing_explanation'
+  | 'no_accepted_change'
+  | 'breaking_without_exemption'
+  | 'excluded_change';
 
 export interface ReleaseIssue {
   id: string;
   severity: 'blocker' | 'warning';
+  kind: ReleaseIssueKind;
   title: string;
   detail: string;
   changeId?: string;
+  candidateId?: string;
 }
+
+export interface ReleaseChangeInfo {
+  change: ContractChange;
+  included: boolean;
+  reason?: string;
+}
+
+export interface ReleaseEvaluation {
+  issues: ReleaseIssue[];
+  /** 本次发布会收集的变化：已接受（含兼容层豁免）且说明齐全 */
+  includedChanges: ContractChange[];
+  changeInfos: ReleaseChangeInfo[];
+  canRelease: boolean;
+}
+
+export const RELEASABLE_REVIEW_STATES: ReviewState[] = ['accepted', 'exemption'];
 
 export const CHANGE_KIND_LABELS: Record<ChangeKind, string> = {
   field_added: '新增字段',
@@ -161,44 +223,114 @@ export function classifyChange(input: {
   }
 }
 
-export function validateForRelease(contract: ApiContract): ReleaseIssue[] {
+function explanationComplete(change: ContractChange): boolean {
+  if (change.compatibility === 'compatible') {
+    return true;
+  }
+  return Boolean(change.impactStatement.trim() && change.migrationPlan.trim());
+}
+
+export function isReleasableChange(change: ContractChange): boolean {
+  return (
+    !change.releasedInVersionId &&
+    RELEASABLE_REVIEW_STATES.includes(change.reviewState) &&
+    explanationComplete(change)
+  );
+}
+
+/**
+ * 发布门禁评估。发布不再整份冻结：只收集已接受（含豁免）且说明齐全的变化，
+ * 基线过期、存在未解决字段冲突或仍开放在当前基线上的候选都会被挡住。
+ */
+export function evaluateRelease(input: {
+  contract: ApiContract;
+  /** 发起发布窗口所基于的基线标识，与 contract.baselineId 不一致即过期 */
+  baselineId: string;
+  activeCandidates: Array<{
+    id: string;
+    windowId: string;
+    baselineId: string;
+    status: string;
+  }>;
+}): ReleaseEvaluation {
+  const { contract, baselineId, activeCandidates } = input;
   const issues: ReleaseIssue[] = [];
-  const pending = contract.changes.filter((change) => change.reviewState === 'pending');
-  pending.forEach((change) => {
+  const includedChanges: ContractChange[] = [];
+  const changeInfos: ReleaseChangeInfo[] = [];
+
+  if (baselineId !== contract.baselineId) {
     issues.push({
-      id: `pending-${change.id}`,
+      id: 'stale-baseline',
       severity: 'blocker',
-      title: '存在未处理变更',
-      detail: `${change.method} ${change.path} 仍处于待评审状态。`,
-      changeId: change.id,
+      kind: 'stale_baseline',
+      title: '发布基线已过期',
+      detail: `当前窗口基于基线 ${baselineId.slice(0, 8)}，最新基线为 ${contract.baselineId.slice(0, 8)}，请刷新到最新基线后再发布。`,
     });
+  }
+
+  activeCandidates.forEach((candidate) => {
+    if (candidate.status === 'conflict') {
+      issues.push({
+        id: `conflict-${candidate.id}`,
+        severity: 'blocker',
+        kind: 'conflict',
+        candidateId: candidate.id,
+        title: '存在未解决的字段冲突',
+        detail: `窗口 ${candidate.windowId} 的候选 ${candidate.id.slice(0, 8)} 仍有同字段冲突待人工选择。`,
+      });
+    } else if (candidate.baselineId !== contract.baselineId) {
+      issues.push({
+        id: `stale-candidate-${candidate.id}`,
+        severity: 'blocker',
+        kind: 'stale_baseline',
+        candidateId: candidate.id,
+        title: '候选基于过期基线',
+        detail: `窗口 ${candidate.windowId} 的候选尚未合并或变基，发布后其修改可能被遗漏，请先处理。`,
+      });
+    } else {
+      issues.push({
+        id: `open-candidate-${candidate.id}`,
+        severity: 'blocker',
+        kind: 'open_candidate',
+        candidateId: candidate.id,
+        title: '仍有未提交的编辑候选',
+        detail: `窗口 ${candidate.windowId} 的候选处于开放状态，请提交或丢弃后再发布。`,
+      });
+    }
   });
 
-  contract.changes
-    .filter((change) => change.reviewState !== 'exemption')
-    .forEach((change) => {
-      if (change.compatibility === 'compatible') {
-        return;
+  contract.changes.forEach((change) => {
+    if (isReleasableChange(change)) {
+      includedChanges.push(change);
+      changeInfos.push({ change, included: true });
+      return;
+    }
+
+    let reason = '';
+    if (change.releasedInVersionId) {
+      reason = `已随 v${change.releasedInVersion ?? '历史版本'} 发布，不重复进入本次快照`;
+    } else if (!RELEASABLE_REVIEW_STATES.includes(change.reviewState)) {
+      reason = '评审尚未接受，不进入本次发布';
+    } else {
+      const missing: string[] = [];
+      if (change.compatibility !== 'compatible') {
+        if (!change.impactStatement.trim()) missing.push('调用方影响说明');
+        if (!change.migrationPlan.trim()) missing.push('迁移方案');
       }
-      if (!change.impactStatement.trim()) {
+      reason = `缺少${missing.join('与')}，不进入本次发布`;
+      if (missing.length) {
         issues.push({
-          id: `impact-${change.id}`,
+          id: `missing-${change.id}`,
           severity: 'blocker',
-          title: '缺少调用方影响说明',
-          detail: `${change.path} 需要说明受影响调用方、流量和业务影响。`,
+          kind: 'missing_explanation',
+          title: `已接受变化缺少${missing.join('与')}`,
+          detail: `${change.method} ${change.path} 已接受但说明不齐全，补齐说明后才能随版本发布。`,
           changeId: change.id,
         });
       }
-      if (!change.migrationPlan.trim()) {
-        issues.push({
-          id: `migration-${change.id}`,
-          severity: 'blocker',
-          title: '缺少迁移方案',
-          detail: `${change.path} 需要给出客户端升级、兼容层或回滚路径。`,
-          changeId: change.id,
-        });
-      }
-    });
+    }
+    changeInfos.push({ change, included: false, reason });
+  });
 
   contract.changes
     .filter(
@@ -211,11 +343,27 @@ export function validateForRelease(contract: ApiContract): ReleaseIssue[] {
       issues.push({
         id: `breaking-${change.id}`,
         severity: 'warning',
-        title: '不兼容变更已接受但未登记豁免',
-        detail: `${change.path} 需要记录兼容层的范围、原因和到期时间。`,
+        kind: 'breaking_without_exemption',
+        title: '不兼容变化已接受但未登记豁免',
+        detail: `${change.path} 建议记录兼容层的范围、原因和到期时间。`,
         changeId: change.id,
       });
     });
 
-  return issues;
+  if (!includedChanges.length) {
+    issues.push({
+      id: 'no-accepted-change',
+      severity: 'blocker',
+      kind: 'no_accepted_change',
+      title: '没有可发布的变化',
+      detail: '本次发布至少需要一项已接受且说明齐全的变化。',
+    });
+  }
+
+  return {
+    issues,
+    includedChanges,
+    changeInfos,
+    canRelease: !issues.some((issue) => issue.severity === 'blocker'),
+  };
 }

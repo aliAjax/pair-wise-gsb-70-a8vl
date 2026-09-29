@@ -111,6 +111,7 @@ export function DashboardPage() {
         consumers: [],
         exemptions: [],
         versions: [],
+        baselineId: `base-${Date.now().toString(36)}-0`,
       };
       await saveContract.mutateAsync(contract);
       setImportText('');

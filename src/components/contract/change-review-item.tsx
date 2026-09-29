@@ -1,4 +1,4 @@
-import { Check, CornerUpLeft, Layers3, Save } from 'lucide-react';
+import { Check, CornerUpLeft, Layers3, Lock, Save } from 'lucide-react';
 import { useState } from 'react';
 import { Badge } from '../ui/badge';
 import { Button } from '../ui/button';
@@ -6,26 +6,33 @@ import { Textarea } from '../ui/textarea';
 import {
   CHANGE_KIND_LABELS,
   type ContractChange,
+  type FieldProvenance,
   type ReviewState,
 } from '../../models/contract';
+import type { MergeableField } from '../../models/candidate';
 import { CompatibilityBadge, ReviewStateBadge } from './compatibility-badge';
 
 interface ChangeReviewItemProps {
   change: ContractChange;
+  /** 当前窗口是否有开放候选；没有时说明字段只读，避免直接覆盖已提交副本 */
+  canDraft: boolean;
+  draftImpact: string;
+  draftMigration: string;
+  onDraftChange: (changeId: string, field: MergeableField, value: string) => void;
   onReview: (changeId: string, state: ReviewState, comment: string) => void;
-  onUpdate: (changeId: string, patch: Partial<ContractChange>) => void;
   onExemption: (changeId: string, reason: string) => void;
 }
 
 export function ChangeReviewItem({
   change,
+  canDraft,
+  draftImpact,
+  draftMigration,
+  onDraftChange,
   onReview,
-  onUpdate,
   onExemption,
 }: ChangeReviewItemProps) {
   const [comment, setComment] = useState(change.reviewComment);
-  const [impact, setImpact] = useState(change.impactStatement);
-  const [migration, setMigration] = useState(change.migrationPlan);
   const [exemptionReason, setExemptionReason] = useState('');
   const [showExemption, setShowExemption] = useState(false);
 
@@ -39,6 +46,7 @@ export function ChangeReviewItem({
             </span>
             <CompatibilityBadge value={change.compatibility} />
             <ReviewStateBadge value={change.reviewState} />
+            {change.releasedInVersion && <Badge tone="slate">已随 v{change.releasedInVersion} 发布</Badge>}
           </div>
           <h3 className="mt-2 text-sm font-semibold text-slate-900">
             {CHANGE_KIND_LABELS[change.kind]}
@@ -74,24 +82,22 @@ export function ChangeReviewItem({
 
       {change.compatibility !== 'compatible' && (
         <div className="mt-4 grid gap-3 lg:grid-cols-2">
-          <div>
-            <label className="mb-1.5 block text-xs font-medium text-slate-700">
-              调用方影响说明
-            </label>
-            <Textarea
-              value={impact}
-              onChange={(event) => setImpact(event.target.value)}
-              placeholder="受影响调用方、版本、流量和业务影响"
-            />
-          </div>
-          <div>
-            <label className="mb-1.5 block text-xs font-medium text-slate-700">迁移方案</label>
-            <Textarea
-              value={migration}
-              onChange={(event) => setMigration(event.target.value)}
-              placeholder="升级顺序、兼容层范围、回滚和截止时间"
-            />
-          </div>
+          <DraftField
+            label="调用方影响说明"
+            placeholder="受影响调用方、版本、流量和业务影响"
+            value={draftImpact}
+            provenance={change.impactProvenance}
+            canDraft={canDraft}
+            onChange={(value) => onDraftChange(change.id, 'impactStatement', value)}
+          />
+          <DraftField
+            label="迁移方案"
+            placeholder="升级顺序、兼容层范围、回滚和截止时间"
+            value={draftMigration}
+            provenance={change.migrationProvenance}
+            canDraft={canDraft}
+            onChange={(value) => onDraftChange(change.id, 'migrationPlan', value)}
+          />
         </div>
       )}
 
@@ -106,19 +112,6 @@ export function ChangeReviewItem({
           />
         </div>
         <div className="flex flex-wrap gap-2">
-          <Button
-            variant="secondary"
-            size="sm"
-            onClick={() =>
-              onUpdate(change.id, {
-                impactStatement: impact,
-                migrationPlan: migration,
-              })
-            }
-          >
-            <Save className="h-3.5 w-3.5" />
-            保存说明
-          </Button>
           <Button
             variant="outline"
             size="sm"
@@ -173,5 +166,47 @@ export function ChangeReviewItem({
         </div>
       )}
     </article>
+  );
+}
+
+function DraftField({
+  label,
+  placeholder,
+  value,
+  provenance,
+  canDraft,
+  onChange,
+}: {
+  label: string;
+  placeholder: string;
+  value: string;
+  provenance?: FieldProvenance;
+  canDraft: boolean;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <div>
+      <div className="mb-1.5 flex flex-wrap items-center justify-between gap-2">
+        <label className="text-xs font-medium text-slate-700">{label}</label>
+        {provenance && (
+          <span className="inline-flex items-center gap-1 rounded-sm bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-500">
+            <Save className="h-3 w-3" />
+            {provenance.source}
+          </span>
+        )}
+      </div>
+      <Textarea
+        value={value}
+        disabled={!canDraft}
+        onChange={(event) => onChange(event.target.value)}
+        placeholder={canDraft ? placeholder : '先在“协作候选”里为当前窗口发起候选，再补充说明'}
+      />
+      {!canDraft && (
+        <p className="mt-1 inline-flex items-center gap-1 text-[11px] text-amber-700">
+          <Lock className="h-3 w-3" />
+          未发起候选时只读，防止覆盖其他窗口刚提交的内容
+        </p>
+      )}
+    </div>
   );
 }
